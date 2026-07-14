@@ -24,7 +24,7 @@ jobs:
       - name: 必要な部品（ライブラリ）をインストールする
         run: |
           pip install -r requirements.txt
-          playwright install chromium
+          pip install beautifulsoup4
 
       - name: 調査プログラムを実行する！
-        run: python satofull.py
+        run: python -u satofull.py
