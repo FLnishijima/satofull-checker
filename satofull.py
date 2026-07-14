@@ -1,10 +1,10 @@
-import asyncio
+import time
 import random
 import urllib.parse
 from datetime import datetime
 import pandas as pd
 import requests
-from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
 
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbz2zDZnU8SVPUSLuK4P-efN2FTKPxIEDH74hWyENd7gbuPNzZK3BMS7N20yT5hLlToYWQ/exec"
 SHEET_URL = "https://docs.google.com/spreadsheets/d/178pUB79bFdfBzor2a3-hvXw6R2lcDFplMzvJvTKsWoQ/export?format=csv"
@@ -14,10 +14,6 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/178pUB79bFdfBzor2a3-hvXw6R2l
 # ==========================================
 CHATWORK_API_TOKEN = "cd3cc8c847ce1d1a0cd518d88e289302"
 CHATWORK_ROOM_ID = "442326223"
-
-# ==========================================
-# ⚙️ スプレッドシートの行ズレ調整設定
-# ==========================================
 OFFSET = -1
 
 def get_target_a_index(b_row_number):
@@ -28,91 +24,56 @@ def get_target_a_index(b_row_number):
     elif 43 <= b_row_number <= 52: return 43 - 1
     return None
 
-async def check_satofull_status(page, keyword, target_product_name):
+def check_satofull_status(keyword, target_product_name):
     print(f"【調査中】: {keyword} （対象: {target_product_name}）")
     encoded_kw = urllib.parse.quote(keyword)
-    search_url = f"https://www.satofull.jp/products/list.php?q={encoded_kw}"
+    # 最大60件まで一度に取得する設定を追加
+    search_url = f"https://www.satofull.jp/products/list.php?q={encoded_kw}&cnt=60"
     
-    try:
-        # ページ遷移。途中でエラーが起きても無視して進む
-        await page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-    except Exception as e:
-        print(f"  ⚠️ ページ遷移エラー（無視して継続します）")
-    
-    # 画面が落ち着くまで長めに待つ
-    await asyncio.sleep(3)
-    
-    # スクロール処理も、1回ごとにエラーをキャッチして絶対にクラッシュさせない
-    for _ in range(3):
-        try:
-            await page.evaluate("window.scrollBy(0, 800)")
-        except Exception:
-            pass
-        await asyncio.sleep(1.5)
-        
-    js_code = r"""
-    () => {
-        const results = [];
-        const seenPr = new Set();
-        const seenNormal = new Set();
-        
-        const links = document.querySelectorAll("a[href*='/products/detail']");
-        
-        links.forEach(a => {
-            const href = a.getAttribute('href');
-            if(!href) return;
-            
-            const match = href.match(/product_id=([a-zA-Z0-9_-]+)/) || href.match(/\/detail\/([a-zA-Z0-9_-]+)/);
-            if(!match) return;
-            const pId = match[1];
-            
-            let card = a.closest('li');
-            if(!card) card = a.closest('div[class*="product"], div[class*="item"], div.pr-area');
-            if(!card) card = a.parentElement.parentElement; 
-            if(!card) return;
-            
-            const html = card.innerHTML;
-            
-            const isPr = html.includes('ico-pr') || 
-                         html.includes('icon-pr') || 
-                         html.includes('alt="PR"') || 
-                         html.includes('alt="ＰＲ"') || 
-                         />\s*PR\s*</i.test(html) || 
-                         />\s*ＰＲ\s*</i.test(html);
-            
-            if (isPr) {
-                if(!seenPr.has(pId)) {
-                    seenPr.add(pId);
-                    results.push({ type: 'PR', text: card.innerText });
-                }
-            } else {
-                if(!seenNormal.has(pId)) {
-                    seenNormal.add(pId);
-                    results.push({ type: 'NORMAL', text: card.innerText });
-                }
-            }
-        });
-        return results;
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8"
     }
-    """
-    
+
     try:
-        valid_cards = await page.evaluate(js_code)
+        response = requests.get(search_url, headers=headers, timeout=15)
+        response.raise_for_status()
     except Exception as e:
-        # データ取得に失敗した場合でも「エラー」と記録して次のキーワードへ進む
-        print(f"  ❌ データ取得エラー（スキップします）")
+        print(f"  ❌ アクセスエラー: {e}")
         return "エラー（取得失敗）"
+
+    soup = BeautifulSoup(response.text, "html.parser")
     
+    # 検索結果のカードをすべて探す
+    items = soup.find_all("div", class_=["product", "item", "pr-area"])
+    if not items:
+        # 別のHTML構造も探す
+        items = soup.find_all("li", class_="item")
+        
+    if not items:
+        print("  ⚠️ 商品が見つかりませんでした。")
+        return "広告なし（圏外）"
+
     pr_count = 0
     normal_count = 0
     target_pr_ranks = []
     target_normal_ranks = []
-    
-    for card in valid_cards:
-        text_clean = card["text"].replace(" ", "").replace(" ", "")
+
+    for item in items:
+        # 商品名テキストの取得
+        title_tag = item.find("h3") or item.find("p", class_="title") or item.find("div", class_="title")
+        if not title_tag:
+            continue
+            
+        text_clean = title_tag.text.replace(" ", "").replace(" ", "").strip()
         target_clean = target_product_name.replace(" ", "").replace(" ", "")
         
-        if card["type"] == 'PR':
+        # PR判定
+        html_str = str(item)
+        is_pr = 'ico-pr' in html_str or 'icon-pr' in html_str or 'alt="PR"' in html_str or 'alt="ＰＲ"' in html_str or '>PR<' in html_str or '>ＰＲ<' in html_str
+        
+        if is_pr:
             pr_count += 1
             if target_clean in text_clean:
                 target_pr_ranks.append(f"{pr_count}位")
@@ -120,7 +81,7 @@ async def check_satofull_status(page, keyword, target_product_name):
             normal_count += 1
             if target_clean in text_clean:
                 target_normal_ranks.append(f"{normal_count}位")
-                
+
     if target_pr_ranks and target_normal_ranks:
         result_text = f"🔴PR({', '.join(target_pr_ranks)}) ＆ 通常({', '.join(target_normal_ranks)})"
     elif target_pr_ranks:
@@ -133,7 +94,7 @@ async def check_satofull_status(page, keyword, target_product_name):
     print(f"  ➡️ 結果: {result_text}")
     return result_text
 
-async def main():
+def main():
     now = datetime.now()
     date_header = now.strftime("%m/%d") if 7 <= now.hour <= 8 else ""
     time_header = now.strftime("%H:%M")
@@ -152,49 +113,21 @@ async def main():
     if 0 <= 0 + OFFSET < total_rows: results[0 + OFFSET] = date_header
     if 0 <= 1 + OFFSET < total_rows: results[1 + OFFSET] = time_header
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled", 
-                "--no-sandbox",
-                "--disable-dev-shm-usage",  # クラウド環境特有のメモリ不足エラーを防止
-                "--disable-gpu",
-                "--window-size=1920,1080"
-            ]
-        )
+    for idx in range(2, total_rows):
+        row_num = idx + 1
+        kw = str(df.iloc[idx, 1]).strip() if pd.notna(df.iloc[idx, 1]) else ""
+        target_a_idx = get_target_a_index(row_num)
         
-        # ボット検知をさらに強力に回避
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1400, "height": 900},
-            java_script_enabled=True
-        )
-        
-        # さらに「ロボットではありません」とブラウザに思い込ませる魔法のスクリプト
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        page = await context.new_page()
-
-        for idx in range(2, total_rows):
-            row_num = idx + 1
-            kw = str(df.iloc[idx, 1]).strip() if pd.notna(df.iloc[idx, 1]) else ""
-            target_a_idx = get_target_a_index(row_num)
+        if kw and target_a_idx is not None:
+            target_product = str(df.iloc[target_a_idx, 0]).strip()
+            result_text = check_satofull_status(kw, target_product)
             
-            if kw and target_a_idx is not None:
-                target_product = str(df.iloc[target_a_idx, 0]).strip()
-                result_text = await check_satofull_status(page, kw, target_product)
-                
-                target_write_idx = idx + OFFSET
-                if 0 <= target_write_idx < total_rows:
-                    results[target_write_idx] = result_text
-                
-                # アクセス間隔を少し長め（3〜5秒）にして優しくアクセスする
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+            target_write_idx = idx + OFFSET
+            if 0 <= target_write_idx < total_rows:
+                results[target_write_idx] = result_text
+            
+            time.sleep(random.uniform(2.0, 4.0))
 
-        await context.close()
-        await browser.close()
-        
     print("\n🚀 スプレッドシートに結果を自動送信しています...")
     payload = {"results": results, "use_custom_header_flow": True}
     
@@ -206,7 +139,6 @@ async def main():
             if CHATWORK_API_TOKEN and CHATWORK_ROOM_ID:
                 cw_url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
                 cw_headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
-                
                 message_body = (
                     "[To:10184838] [To:5295349]\n"
                     "[info][title]自動通知[/title]"
@@ -215,15 +147,12 @@ async def main():
                     "https://docs.google.com/spreadsheets/d/178pUB79bFdfBzor2a3-hvXw6R2lcDFplMzvJvTKsWoQ/edit"
                     "[/info]"
                 )
-                
-                cw_data = {"body": message_body}
-                requests.post(cw_url, headers=cw_headers, data=cw_data)
+                requests.post(cw_url, headers=cw_headers, data={"body": message_body})
                 print("📩 チャットワークに通知を送信しました！")
-                
         else:
             print(f"❌ 送信エラー: {response.status_code}")
     except Exception as e:
         print(f"❌ 送信エラー: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
