@@ -34,18 +34,22 @@ async def check_satofull_status(page, keyword, target_product_name):
     search_url = f"https://www.satofull.jp/products/list.php?q={encoded_kw}"
     
     try:
+        # ページ遷移。途中でエラーが起きても無視して進む
         await page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  ⚠️ ページ遷移エラー（無視して継続します）")
     
-    await page.wait_for_timeout(1000)
-    await page.evaluate("window.scrollBy(0, 800)")
-    await page.wait_for_timeout(1000)
-    await page.evaluate("window.scrollBy(0, 800)")
-    await page.wait_for_timeout(1000)
-    await page.evaluate("window.scrollBy(0, 800)")
-    await page.wait_for_timeout(1500)
+    # 画面が落ち着くまで長めに待つ
+    await asyncio.sleep(3)
     
+    # スクロール処理も、1回ごとにエラーをキャッチして絶対にクラッシュさせない
+    for _ in range(3):
+        try:
+            await page.evaluate("window.scrollBy(0, 800)")
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        
     js_code = r"""
     () => {
         const results = [];
@@ -65,6 +69,7 @@ async def check_satofull_status(page, keyword, target_product_name):
             let card = a.closest('li');
             if(!card) card = a.closest('div[class*="product"], div[class*="item"], div.pr-area');
             if(!card) card = a.parentElement.parentElement; 
+            if(!card) return;
             
             const html = card.innerHTML;
             
@@ -91,7 +96,12 @@ async def check_satofull_status(page, keyword, target_product_name):
     }
     """
     
-    valid_cards = await page.evaluate(js_code)
+    try:
+        valid_cards = await page.evaluate(js_code)
+    except Exception as e:
+        # データ取得に失敗した場合でも「エラー」と記録して次のキーワードへ進む
+        print(f"  ❌ データ取得エラー（スキップします）")
+        return "エラー（取得失敗）"
     
     pr_count = 0
     normal_count = 0
@@ -143,13 +153,28 @@ async def main():
     if 0 <= 1 + OFFSET < total_rows: results[1 + OFFSET] = time_header
 
     async with async_playwright() as p:
-        # ★ クラウド（画面なし環境）で動かすため headless=True に変更しています
         browser = await p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+            args=[
+                "--disable-blink-features=AutomationControlled", 
+                "--no-sandbox",
+                "--disable-dev-shm-usage",  # クラウド環境特有のメモリ不足エラーを防止
+                "--disable-gpu",
+                "--window-size=1920,1080"
+            ]
         )
-        page = await browser.new_page()
-        await page.set_viewport_size({"width": 1400, "height": 900})
+        
+        # ボット検知をさらに強力に回避
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1400, "height": 900},
+            java_script_enabled=True
+        )
+        
+        # さらに「ロボットではありません」とブラウザに思い込ませる魔法のスクリプト
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        page = await context.new_page()
 
         for idx in range(2, total_rows):
             row_num = idx + 1
@@ -164,8 +189,10 @@ async def main():
                 if 0 <= target_write_idx < total_rows:
                     results[target_write_idx] = result_text
                 
-                await asyncio.sleep(random.uniform(1.5, 2.5))
+                # アクセス間隔を少し長め（3〜5秒）にして優しくアクセスする
+                await asyncio.sleep(random.uniform(3.0, 5.0))
 
+        await context.close()
         await browser.close()
         
     print("\n🚀 スプレッドシートに結果を自動送信しています...")
@@ -176,7 +203,6 @@ async def main():
         if response.status_code == 200:
             print("✨ 調査完了！")
             
-            # --- Chatworkに通知を送る処理 ---
             if CHATWORK_API_TOKEN and CHATWORK_ROOM_ID:
                 cw_url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
                 cw_headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
